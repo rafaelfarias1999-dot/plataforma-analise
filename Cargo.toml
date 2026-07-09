@@ -17,6 +17,7 @@ members = [
     "backend/common",
     "backend/aggregation-core",
     "backend/feed-handler",
+    "backend/broadcast-hub",
 ]
 resolver = "2"
 
