@@ -41,6 +41,20 @@ toml = "0.8"
 async-trait = "0.1"
 
 # =============================================================================
+# Adiciona ele aos membros do workspace
+# =============================================================================
+
+[workspace]
+members = [
+    "backend/contracts-rs",
+    "backend/common",
+    "backend/aggregation-core",
+    "backend/feed-handler",
+    "backend/server",
+]
+resolver = "2"
+
+# =============================================================================
 # Perfil Release — Otimizado para latência mínima em produção
 # =============================================================================
 #
