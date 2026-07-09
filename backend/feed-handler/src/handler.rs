@@ -141,7 +141,7 @@ impl FeedHandlerService {
 
             // Enviar ao Sequencer (validação + armazenamento)
             let mut sequencer = self.sequencer.write().await;
-            match sequencer.process_tick(normalized) {
+            match sequencer.process_tick(normalized).await {
                 Ok(seq) => {
                     tracing::trace!(seq = seq, ts_ns = normalized.ts_ns, "Tick processado");
                 }
