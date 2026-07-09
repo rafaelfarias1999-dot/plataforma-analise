@@ -1,0 +1,13 @@
+[package]
+name = "feed-handler"
+version = "0.1.0"
+edition = "2021"
+description = "Feed handler: conector de provider, normalização e orquestração de ingestão de ticks"
+
+[dependencies]
+common = { path = "../common" }
+contracts-rs = { path = "../contracts-rs" }
+aggregation-core = { path = "../aggregation-core" }
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true

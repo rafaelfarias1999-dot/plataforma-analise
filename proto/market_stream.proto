@@ -1,0 +1,243 @@
+// =============================================================================
+// market_stream.proto — Protocolo de mensagens WebSocket (backend → frontend)
+// =============================================================================
+//
+// Decisão Arquitetural:
+//   Este schema define o protocolo de comunicação em tempo real entre o backend
+//   Rust e o frontend via WebSocket. As mensagens são serializadas em Protobuf
+//   binário para minimizar latência e largura de banda.
+//
+//   Três tipos de mensagens de candle existem por razões de eficiência:
+//
+//   1. CandleDelta: Atualização incremental de um candle aberto. Envia apenas
+//      H/L/C porque O (open) é imutável após a abertura do bucket. Isso reduz
+//      o payload em ~25% comparado ao envio do candle completo.
+//
+//   2. CandleClose: Sinaliza o fechamento definitivo de um candle e informa
+//      o timestamp do próximo bucket. O frontend pode então consolidar o
+//      candle e preparar a próxima célula.
+//
+//   3. Snapshot: Payload inicial de conexão ou reconexão. Formato colunar
+//      (arrays paralelos) alinhado com TypedArrays do frontend para cópia
+//      direta em memória (zero-copy no lado JS via Float64Array views).
+//
+// =============================================================================
+
+syntax = "proto3";
+package market_stream;
+
+import "tick.proto";
+
+// =============================================================================
+// Timeframe — Enumeração de todos os períodos suportados pela plataforma
+// =============================================================================
+//
+// Decisão: Incluímos timeframes sub-minuto (S5, S10, S15, S30) para análise
+// de microestrutura e scalping. O enum inicia em TF_TICK=0 como valor default
+// do protobuf, representando o stream de ticks brutos sem agregação.
+//
+// A ordem numérica dos valores segue a granularidade crescente, permitindo
+// comparações simples: if (tf > TF_M5) { ... } para filtrar timeframes.
+enum Timeframe {
+  TF_TICK = 0;   // Stream de ticks brutos (sem agregação)
+  TF_S5   = 1;   // 5 segundos
+  TF_S10  = 2;   // 10 segundos
+  TF_S15  = 3;   // 15 segundos
+  TF_S30  = 4;   // 30 segundos
+  TF_M1   = 5;   // 1 minuto
+  TF_M2   = 6;   // 2 minutos
+  TF_M3   = 7;   // 3 minutos
+  TF_M5   = 8;   // 5 minutos
+  TF_M10  = 9;   // 10 minutos
+  TF_M15  = 10;  // 15 minutos
+  TF_M30  = 11;  // 30 minutos
+  TF_H1   = 12;  // 1 hora
+  TF_H2   = 13;  // 2 horas
+  TF_H4   = 14;  // 4 horas
+  TF_D1   = 15;  // 1 dia (diário)
+}
+
+// =============================================================================
+// Candle — Representação completa de um candle OHLCV
+// =============================================================================
+//
+// Utilizado dentro do CandleClose para enviar o candle finalizado.
+// Todos os preços em micropips (int64). Timestamp do bucket em nanossegundos.
+message Candle {
+  // Timestamp de abertura do bucket em nanossegundos.
+  // Alinhado ao início do período (ex: para M5 às 14:35, t = 14:35:00.000000000).
+  uint64 t = 1;
+
+  // Preço de abertura (open) em micropips.
+  // Imutável após o primeiro tick do bucket — definido uma vez e nunca alterado.
+  int64 o = 2;
+
+  // Preço máximo (high) em micropips.
+  // Atualizado a cada tick: high = max(high, tick.mid)
+  int64 h = 3;
+
+  // Preço mínimo (low) em micropips.
+  // Atualizado a cada tick: low = min(low, tick.mid)
+  int64 l = 4;
+
+  // Preço de fechamento (close) em micropips.
+  // Atualizado a cada tick: close = tick.mid (último preço recebido no bucket)
+  int64 c = 5;
+
+  // Volume acumulado do bucket. Optional porque volume nem sempre está
+  // disponível em FX — NUNCA fabricamos valores.
+  optional uint64 v = 6;
+}
+
+// =============================================================================
+// CandleDelta — Atualização incremental de candle aberto
+// =============================================================================
+//
+// Decisão de Performance:
+//   Enviamos apenas H/L/C em cada delta porque:
+//   - O (open) é imutável após o primeiro tick do bucket
+//   - Reduz o tamanho do payload em ~25% (1 campo int64 a menos)
+//   - Em timeframes curtos (S5), centenas de deltas por minuto se acumulam
+//   - O frontend mantém O em memória e reconstrói o candle completo
+//
+// O campo `seq` permite ao frontend detectar deltas fora de ordem e descartá-los.
+message CandleDelta {
+  // Par de moedas (ex: "EURUSD")
+  string symbol = 1;
+
+  // Timeframe ao qual este delta pertence
+  Timeframe timeframe = 2;
+
+  // Timestamp de abertura do bucket ao qual este delta pertence.
+  // Usado como chave para identificar qual candle está sendo atualizado.
+  uint64 bucket_ts = 3;
+
+  // Preço máximo atualizado (high) em micropips
+  int64 high = 4;
+
+  // Preço mínimo atualizado (low) em micropips
+  int64 low = 5;
+
+  // Preço de fechamento atual (último tick) em micropips
+  int64 close = 6;
+
+  // Volume acumulado até o momento (optional — nunca fabricado)
+  optional uint64 volume = 7;
+
+  // Número de sequência do delta para ordenação e deduplicação.
+  // Monotonicamente crescente dentro de cada (symbol, timeframe, bucket_ts).
+  uint64 seq = 8;
+}
+
+// =============================================================================
+// CandleClose — Notificação de fechamento definitivo de candle
+// =============================================================================
+//
+// Enviado exatamente uma vez quando um bucket de tempo se encerra.
+// Contém o candle OHLCV completo e finalizado, mais o timestamp do próximo
+// bucket para que o frontend possa pré-alocar a célula seguinte.
+//
+// Após receber um CandleClose, o frontend deve:
+//   1. Consolidar o candle na série histórica
+//   2. Parar de aceitar CandleDeltas para aquele bucket_ts
+//   3. Iniciar um novo candle com open = close do candle anterior (gap check)
+message CandleClose {
+  // Par de moedas (ex: "EURUSD")
+  string symbol = 1;
+
+  // Timeframe do candle finalizado
+  Timeframe timeframe = 2;
+
+  // Candle OHLCV completo e imutável
+  Candle candle = 3;
+
+  // Timestamp de abertura do próximo bucket em nanossegundos.
+  // Permite ao frontend pré-alocar sem calcular o próximo alinhamento.
+  uint64 next_bucket_ts = 4;
+}
+
+// =============================================================================
+// Snapshot — Payload inicial com série histórica em formato colunar
+// =============================================================================
+//
+// Decisão de Performance (Formato Colunar):
+//   O formato tradicional "array de objetos" ({t,o,h,l,c,v}, {t,o,h,l,c,v}, ...)
+//   requer deserialização individual de cada candle no frontend.
+//
+//   O formato colunar (arrays paralelos) permite:
+//   - Cópia direta para TypedArrays (Float64Array, BigUint64Array)
+//   - Zero overhead de deserialização no hot path do frontend
+//   - Compatibilidade nativa com WebGL e bibliotecas de charting
+//   - Compressão mais eficiente (valores similares agrupados)
+//
+//   Trade-off: O schema é menos legível, mas a performance compensa
+//   amplamente para snapshots de 500-2000 candles.
+//
+// Invariante: Todos os arrays repeated devem ter exatamente `count` elementos.
+// O backend GARANTE essa invariante; o frontend pode confiar nela.
+message Snapshot {
+  // Par de moedas (ex: "EURUSD")
+  string symbol = 1;
+
+  // Timeframe dos candles no snapshot
+  Timeframe timeframe = 2;
+
+  // Número total de candles no snapshot.
+  // Redundante com len(timestamps), mas permite pré-alocação antes
+  // de iterar os arrays repeated.
+  uint32 count = 3;
+
+  // Arrays colunares — todos com exatamente `count` elementos:
+
+  // Timestamps de abertura de cada bucket (nanossegundos)
+  repeated uint64 timestamps = 4;
+
+  // Preços open em micropips
+  repeated int64 opens = 5;
+
+  // Preços high em micropips
+  repeated int64 highs = 6;
+
+  // Preços low em micropips
+  repeated int64 lows = 7;
+
+  // Preços close em micropips
+  repeated int64 closes = 8;
+
+  // Volumes acumulados por bucket.
+  // Nota: usamos int64 (não uint64) nos volumes do snapshot para
+  // compatibilidade com arrays homogêneos. Valor -1 indica volume
+  // não disponível (equivalente a None no CandleDelta).
+  repeated int64 volumes = 9;
+}
+
+// =============================================================================
+// MarketMessage — Envelope principal do protocolo WebSocket
+// =============================================================================
+//
+// Toda mensagem enviada pelo backend via WebSocket é um MarketMessage
+// serializado em Protobuf binário. O campo oneof `payload` permite ao
+// frontend fazer pattern matching no tipo de mensagem e processar
+// adequadamente.
+//
+// Fluxo típico de uma sessão WebSocket:
+//   1. Cliente conecta e solicita (symbol, timeframe)
+//   2. Backend envia Snapshot com série histórica
+//   3. Backend envia CandleDeltas em tempo real
+//   4. Ao fechar um bucket, backend envia CandleClose
+//   5. Opcionalmente, ticks brutos via TickEnvelope
+message MarketMessage {
+  oneof payload {
+    // Tick bruto normalizado — para clientes que assinam o stream de ticks
+    tick.TickEnvelope tick = 1;
+
+    // Atualização incremental de candle aberto
+    CandleDelta candle_delta = 2;
+
+    // Notificação de candle finalizado
+    CandleClose candle_close = 3;
+
+    // Snapshot histórico (conexão inicial ou reconexão)
+    Snapshot snapshot = 4;
+  }
+}

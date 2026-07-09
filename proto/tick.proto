@@ -1,0 +1,70 @@
+// =============================================================================
+// tick.proto — Schema do tick normalizado para a pipeline interna
+// =============================================================================
+//
+// Decisão Arquitetural:
+//   Todos os preços transitam pela pipeline como inteiros em micropips
+//   (preço × 10^6 como int64). Essa representação em ponto fixo elimina
+//   completamente os erros de arredondamento de ponto flutuante que seriam
+//   catastróficos na agregação de candles e no cálculo de indicadores.
+//
+//   A conversão float↔int ocorre APENAS nas bordas do sistema:
+//     - Entrada: Feed Handler converte o preço do provider para micropips
+//     - Saída: Broadcast Hub converte micropips de volta para float
+//
+//   Timestamps utilizam nanossegundos (uint64) do relógio do provider como
+//   fonte de verdade, evitando reordenação por clock drift do servidor.
+//
+// =============================================================================
+
+syntax = "proto3";
+package tick;
+
+// TickEnvelope: tick bruto normalizado que transita pela pipeline interna.
+//
+// Representa um único evento de atualização de preço recebido de um provider
+// de dados de mercado. Cada tick carrega bid, ask e mid em micropips, mais
+// metadados de sequenciamento para detecção de gaps e ordenação.
+//
+// Invariantes:
+//   - bid <= mid <= ask (sempre válido para spreads positivos)
+//   - mid = (bid + ask) / 2 (divisão inteira, calculado no Feed Handler)
+//   - seq é monotonicamente crescente por sessão
+//   - volume NUNCA é fabricado — None quando o provider não fornece
+message TickEnvelope {
+  // Par de moedas no formato sem delimitador (ex: "EURUSD").
+  // Padronizado em uppercase pelo Feed Handler na normalização.
+  string symbol = 1;
+
+  // Timestamp em nanossegundos do relógio do provider de dados.
+  // Utilizamos o relógio do provider (e não o do servidor) como fonte
+  // de verdade para evitar distorções causadas por latência de rede
+  // e clock drift entre máquinas.
+  uint64 ts_ns = 2;
+
+  // Preço bid (melhor oferta de compra) em micropips.
+  // Exemplo: 1.08423 → 1084230
+  int64 bid = 3;
+
+  // Preço ask (melhor oferta de venda) em micropips.
+  // Spread = ask - bid (sempre em micropips, sem perda de precisão).
+  int64 ask = 4;
+
+  // Preço mid calculado: (bid + ask) / 2 (divisão inteira).
+  // Pré-calculado no Feed Handler para evitar recomputação em cada
+  // consumidor downstream (agregador, indicadores, etc.).
+  int64 mid = 5;
+
+  // Volume de negociação associado ao tick, quando disponível.
+  // Marcado como optional porque nem todos os providers de FX fornecem
+  // volume real — e NUNCA fabricamos dados. Se o provider não enviar
+  // volume, este campo permanece ausente (None).
+  optional uint64 volume = 6;
+
+  // Número de sequência monotonicamente crescente atribuído pelo
+  // sequenciador central. Permite:
+  //   - Detecção de gaps (ticks perdidos)
+  //   - Ordenação determinística mesmo com timestamps iguais
+  //   - Replay preciso para backtesting
+  uint64 seq = 7;
+}

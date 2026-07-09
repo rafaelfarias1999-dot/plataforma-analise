@@ -1,0 +1,82 @@
+# =============================================================================
+# Cargo.toml — Workspace raiz da plataforma de análise EUR/USD
+# =============================================================================
+#
+# Decisão Arquitetural:
+#   Utilizamos um Cargo workspace para gerenciar múltiplos crates com
+#   dependências compartilhadas. Isso garante:
+#     - Versões consistentes de dependências via [workspace.dependencies]
+#     - Compilação incremental eficiente (crates independentes em paralelo)
+#     - Um único `cargo test --workspace` para CI/CD
+#
+# =============================================================================
+
+[workspace]
+members = [
+    "backend/contracts-rs",
+    "backend/common",
+    "backend/aggregation-core",
+    "backend/feed-handler",
+]
+resolver = "2"
+
+# =============================================================================
+# Dependências compartilhadas pelo workspace
+# =============================================================================
+#
+# Todas as crates do workspace devem usar `dep.workspace = true` para
+# referenciar estas versões. Isso evita divergência de versões entre crates.
+# =============================================================================
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+prost = "0.13"
+prost-build = "0.13"
+prost-types = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+async-trait = "0.1"
+
+# =============================================================================
+# Perfil Release — Otimizado para latência mínima em produção
+# =============================================================================
+#
+# Justificativa das configurações:
+#   - opt-level = 3: otimização máxima (loops, vetorização, inlining)
+#   - lto = "fat": Link-Time Optimization completo — analisa todo o programa
+#     para eliminar código morto e otimizar chamadas cross-crate
+#   - codegen-units = 1: compila cada crate como uma unidade, maximizando
+#     oportunidades de otimização (trade-off: compilação mais lenta)
+#   - panic = "abort": elimina overhead de unwinding, reduz tamanho do
+#     binário. Em sistemas financeiros, um panic deve encerrar o processo
+#     imediatamente (fail-fast) — não tentamos recuperar
+#   - strip = "symbols": remove tabela de símbolos do binário final,
+#     reduzindo tamanho para deployment
+# =============================================================================
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# =============================================================================
+# Perfil Dev — Balanceado entre velocidade de compilação e debugging
+# =============================================================================
+#
+# Justificativa:
+#   - opt-level = 1: otimização básica para evitar lentidão extrema em
+#     modo debug (especialmente com Tokio), sem sacrificar muito a
+#     velocidade de compilação
+#   - debug = "line-tables-only": gera informação de debug suficiente
+#     para stack traces legíveis, mas sem informação completa de variáveis
+#     (reduz tempo de link e tamanho dos artefatos de debug)
+# =============================================================================
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"

@@ -1,0 +1,12 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+description = "Tipos compartilhados, configuração e erros da plataforma de análise EUR/USD"
+
+[dependencies]
+contracts-rs = { path = "../contracts-rs" }
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true

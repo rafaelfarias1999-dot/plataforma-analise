@@ -1,0 +1,25 @@
+# =============================================================================
+# contracts-rs — Tipos Protobuf gerados para a plataforma de análise EUR/USD
+# =============================================================================
+#
+# Esta crate segue o padrão "Proto Crate": isola a geração de código Protobuf
+# em uma crate dedicada, compilando os .proto uma única vez. Todos os outros
+# crates do workspace dependem desta crate para acessar os tipos gerados.
+#
+# Vantagens:
+#   - Compilação dos .proto acontece uma única vez (build.rs)
+#   - Schema como Single Source of Truth compartilhado
+#   - Mudanças no .proto recompilam apenas esta crate + dependentes
+# =============================================================================
+
+[package]
+name = "contracts-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Tipos Protobuf gerados para a plataforma de análise EUR/USD"
+
+[dependencies]
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

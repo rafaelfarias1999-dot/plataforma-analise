@@ -1,0 +1,11 @@
+[package]
+name = "aggregation-core"
+version = "0.1.0"
+edition = "2021"
+description = "Ring buffers, sequencer e tick store para a plataforma de análise EUR/USD"
+
+[dependencies]
+common = { path = "../common" }
+contracts-rs = { path = "../contracts-rs" }
+tokio.workspace = true
+tracing.workspace = true
