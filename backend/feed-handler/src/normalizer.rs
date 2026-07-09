@@ -1,25 +1,21 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use common::{NormalizedTick, NormalizationError, Symbol, TickSource};
 use contracts_rs::price_to_micropips;
 use tracing::warn;
 use crate::provider::RawTick;
 
-/// Limites de validação para detecção de anomalias.
-const MAX_SPREAD_PIPS: f64 = 50.0;  // Spread máximo aceitável em pips
-const MAX_FUTURE_TOLERANCE_NS: u64 = 5_000_000_000; // 5 segundos de tolerância para clock skew
+const MAX_SPREAD_PIPS: f64 = 50.0;
+const MAX_FUTURE_TOLERANCE_NS: u64 = 5_000_000_000; // 5s de tolerância p/ clock skew
 
-/// Normalizador de ticks — fronteira de precisão do sistema.
-///
-/// # Responsabilidade (SRP)
-/// Converte ticks brutos (float) para a representação interna de alta performance
-/// (micropips inteiros). Esta é a ÚNICA fronteira onde float→int acontece na
-/// pipeline de ingestão.
+/// Normalizador de ticks — fronteira de precisão do sistema (float → micropips).
 ///
 /// # Validações
-/// - Preço bid > 0
+/// - bid > 0
 /// - ask >= bid (spread não negativo)
-/// - Spread dentro de limites aceitáveis (detecção de anomalia)
-/// - Timestamp > 0 e não no futuro distante (detecção de clock skew)
-/// - Símbolo reconhecido
+/// - spread dentro do limite (detecção de anomalia)
+/// - timestamp > 0 e não no futuro além da tolerância (detecção de clock skew)
+/// - símbolo reconhecido
 pub struct TickNormalizer {
     source: TickSource,
     max_spread_pips: f64,
@@ -40,56 +36,79 @@ impl TickNormalizer {
         self
     }
 
-    /// Normaliza um tick bruto para a representação interna.
-    ///
-    /// # Integridade
-    /// O `mid` é calculado como a média aritmética de bid e ask em micropips:
-    ///   mid = (bid_micropips + ask_micropips) / 2
-    /// Isso garante que mid é determinístico e reprodutível.
-    ///
-    /// `seq` é inicializado como 0 aqui — será atribuído pelo Sequencer.
+    pub fn with_max_future_tolerance_ns(mut self, ns: u64) -> Self {
+        self.max_future_tolerance_ns = ns;
+        self
+    }
+
+    /// Relógio de parede em ns Unix.
+    #[inline]
+    fn now_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Normaliza usando o relógio real como referência de "agora".
     pub fn normalize(&self, raw: &RawTick) -> Result<NormalizedTick, NormalizationError> {
-        // Validação: símbolo reconhecido
+        self.normalize_with_now(raw, Self::now_ns())
+    }
+
+    /// Versão pura e testável: recebe `now_ns` explícito.
+    ///
+    /// # Correção (bug #6)
+    /// A validação de timestamp futuro agora é aplicada de fato. Um tick com
+    /// `ts_ns` além de `now_ns + tolerância` é rejeitado (clock skew do provider),
+    /// em vez de contaminar a monotonicidade do Sequencer com um timestamp irreal.
+    pub fn normalize_with_now(
+        &self,
+        raw: &RawTick,
+        now_ns: u64,
+    ) -> Result<NormalizedTick, NormalizationError> {
         let symbol = Symbol::from_str_symbol(&raw.symbol)
             .ok_or_else(|| NormalizationError::UnknownSymbol(raw.symbol.clone()))?;
 
-        // Validação: bid > 0
         if raw.bid <= 0.0 {
             return Err(NormalizationError::InvalidBid(raw.bid));
         }
 
-        // Validação: ask >= bid
         if raw.ask < raw.bid {
-            return Err(NormalizationError::InvalidSpread {
-                bid: raw.bid,
-                ask: raw.ask,
-            });
+            return Err(NormalizationError::InvalidSpread { bid: raw.bid, ask: raw.ask });
         }
 
-        // Validação: spread aceitável
-        let spread_pips = (raw.ask - raw.bid) * 10_000.0; // 1 pip = 0.0001 para EUR/USD
+        let spread_pips = (raw.ask - raw.bid) * 10_000.0; // 1 pip = 0.0001 (EUR/USD)
         if spread_pips > self.max_spread_pips {
-            warn!(
-                spread_pips = spread_pips,
-                max_pips = self.max_spread_pips,
-                "Spread anormal detectado"
-            );
+            warn!(spread_pips, max_pips = self.max_spread_pips, "Spread anormal detectado");
             return Err(NormalizationError::AbnormalSpread {
                 spread_pips,
                 max_pips: self.max_spread_pips,
             });
         }
 
-        // Validação: timestamp válido
         if raw.timestamp_ns == 0 {
             return Err(NormalizationError::InvalidTimestamp(0));
         }
 
-        // Conversão float → micropips (FRONTEIRA DE PRECISÃO)
+        // NOVO: rejeita timestamp no futuro além da tolerância (clock skew).
+        // `now_ns == 0` significa relógio indisponível → não valida (fail-open p/ não
+        // travar ingestão por falha de clock local; a monotonicidade ainda protege).
+        if now_ns != 0 && raw.timestamp_ns > now_ns.saturating_add(self.max_future_tolerance_ns) {
+            warn!(
+                tick_ts = raw.timestamp_ns,
+                now = now_ns,
+                "Timestamp no futuro além da tolerância; tick rejeitado"
+            );
+            return Err(NormalizationError::FutureTimestamp {
+                tick_ts: raw.timestamp_ns,
+                now: now_ns,
+            });
+        }
+
+        // Conversão float → micropips (FRONTEIRA DE PRECISÃO).
         let bid = price_to_micropips(raw.bid);
         let ask = price_to_micropips(raw.ask);
-        // mid calculado em inteiros para evitar acumular erro de float
-        let mid = (bid + ask) / 2;
+        let mid = (bid + ask) / 2; // em inteiros, sem acumular erro de float
 
         Ok(NormalizedTick {
             symbol,
@@ -98,8 +117,51 @@ impl TickNormalizer {
             ask,
             mid,
             volume: raw.volume,
-            seq: 0, // Será atribuído pelo Sequencer
+            seq: 0, // atribuído pelo Sequencer
             source: self.source,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(ts_ns: u64) -> RawTick {
+        RawTick {
+            symbol: "EURUSD".to_string(),
+            timestamp_ns: ts_ns,
+            bid: 1.08420,
+            ask: 1.08422,
+            volume: None,
+        }
+    }
+
+    #[test]
+    fn test_accepts_present_timestamp() {
+        let n = TickNormalizer::new(TickSource::Test);
+        let now = 1_000_000_000_000u64;
+        assert!(n.normalize_with_now(&raw(now), now).is_ok());
+    }
+
+    #[test]
+    fn test_accepts_within_tolerance() {
+        let n = TickNormalizer::new(TickSource::Test);
+        let now = 1_000_000_000_000u64;
+        assert!(n.normalize_with_now(&raw(now + 3_000_000_000), now).is_ok());
+    }
+
+    #[test]
+    fn test_rejects_future_beyond_tolerance() {
+        let n = TickNormalizer::new(TickSource::Test);
+        let now = 1_000_000_000_000u64;
+        let res = n.normalize_with_now(&raw(now + 10_000_000_000), now);
+        assert!(matches!(res, Err(NormalizationError::FutureTimestamp { .. })));
+    }
+
+    #[test]
+    fn test_clock_unavailable_fails_open() {
+        let n = TickNormalizer::new(TickSource::Test);
+        assert!(n.normalize_with_now(&raw(999), 0).is_ok());
     }
 }
