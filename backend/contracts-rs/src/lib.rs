@@ -51,6 +51,33 @@ pub fn micropips_to_price(micropips: i64) -> f64 {
     micropips as f64 / PRICE_SCALE as f64
 }
 
+// === Representação canônica de volume ausente ===
+//
+// FONTE ÚNICA. Mensagens escalares (Candle/CandleDelta/TickEnvelope) usam
+// `optional uint64` do proto3 → None = ausente. Arrays colunares (Snapshot)
+// não suportam optional por elemento em proto3, então usam esta sentinela.
+// O frontend decodifica VOLUME_NONE_SENTINEL → NaN no Float32Array. Um único
+// conceito ("sem volume"), duas codificações de transporte, zero ambiguidade.
+
+/// Sentinela de "sem volume" em arrays colunares (Snapshot.volumes: repeated int64).
+/// NUNCA use 0: zero é um volume real e válido.
+pub const VOLUME_NONE_SENTINEL: i64 = -1;
+
+/// `Option<u64>` → i64 para o array colunar do Snapshot.
+#[inline(always)]
+pub fn volume_to_sentinel(v: Option<u64>) -> i64 {
+    match v {
+        Some(vol) => vol as i64,
+        None => VOLUME_NONE_SENTINEL,
+    }
+}
+
+/// i64 do array colunar → `Option<u64>`. Sentinela (e qualquer negativo) → None.
+#[inline(always)]
+pub fn volume_from_sentinel(raw: i64) -> Option<u64> {
+    if raw < 0 { None } else { Some(raw as u64) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
