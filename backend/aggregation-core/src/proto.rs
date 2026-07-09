@@ -9,14 +9,11 @@
 
 use common::proto::timeframe_to_i32;
 use common::{NormalizedTick, Timeframe};
-use contracts_rs::market_stream as ms;
+use contracts_rs::{market_stream as ms, tick as pt, volume_to_sentinel};
 use contracts_rs::tick as pt;
 
 use crate::aggregator::CandleDelta;
 use crate::candle::Candle;
-
-/// Sentinela de "sem volume" no formato colunar do Snapshot (repeated int64).
-const VOLUME_NONE: i64 = -1;
 
 /// `NormalizedTick` → `tick.TickEnvelope`.
 pub fn tick_to_proto(t: &NormalizedTick) -> pt::TickEnvelope {
