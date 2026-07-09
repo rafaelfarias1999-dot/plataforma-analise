@@ -1,0 +1,15 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+description = "Binário orquestrador: amarra feed-handler, sequencer e aggregation-core"
+
+[dependencies]
+common = { path = "../common" }
+contracts-rs = { path = "../contracts-rs" }
+aggregation-core = { path = "../aggregation-core" }
+feed-handler = { path = "../feed-handler" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
