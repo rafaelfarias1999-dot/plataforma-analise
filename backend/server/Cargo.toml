@@ -9,6 +9,7 @@ common = { path = "../common" }
 contracts-rs = { path = "../contracts-rs" }
 aggregation-core = { path = "../aggregation-core" }
 feed-handler = { path = "../feed-handler" }
+broadcast-hub = { path = "../broadcast-hub" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
