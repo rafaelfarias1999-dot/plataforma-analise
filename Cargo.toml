@@ -39,6 +39,8 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 async-trait = "0.1"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 # =============================================================================
 # Adiciona ele aos membros do workspace
