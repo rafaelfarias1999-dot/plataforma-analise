@@ -76,17 +76,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- 6. Pega o status_receiver ANTES de mover o handler pra task ---
     let status_rx = feed_handler.status_receiver();
 
-    // --- 7. Aggregator, já ligado ao status (não fabrica flat em DISCONNECTED) ---
+    // --- 7. Aggregator, já ligado ao status ---
     let timeframes: &[Timeframe] = Timeframe::all_candle_timeframes();
-    let (mut aggregator, _stores) = MultiTimeframeAggregator::new(
+    let (aggregator, stores) = MultiTimeframeAggregator::new(
         tick_rx,
         event_tx.clone(),
         timeframes,
         config.tick_buffer.candle_capacity,
     );
     let mut aggregator = aggregator.with_status_receiver(status_rx);
-    // `_stores` é o HashMap<Timeframe, CandleStore> — passe ao broadcast-hub
-    // quando ele existir, pra servir snapshots iniciais.
+
+    // --- 7b. Broadcast Hub (WebSocket) ---
+    let hub_state = std::sync::Arc::new(broadcast_hub::HubState {
+        event_tx: event_tx.clone(),
+        stores, // move o HashMap<Timeframe, CandleStore> pro hub servir snapshots
+        config: broadcast_hub::HubConfig {
+            bind_addr: config.network.ws_bind_addr.clone(),
+            port: config.network.ws_port,
+            symbol: config.symbol.clone(),
+        },
+    });
+    
+    let hub_task = tokio::spawn(async move {
+        if let Err(e) = broadcast_hub::run(hub_state).await {
+            error!(error = %e, "Broadcast Hub encerrou com erro");
+        }
+    });
 
     // --- 8. Sobe as tasks ---
     let feed_task = tokio::spawn(async move {
@@ -108,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         r = feed_task => { info!(?r, "feed_task terminou"); }
         r = agg_task => { info!(?r, "agg_task terminou"); }
+        r = hub_task => { info!(?r, "hub_task terminou"); }
     }
 
     Ok(())
