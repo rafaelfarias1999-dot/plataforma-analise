@@ -10,7 +10,6 @@
 use common::proto::timeframe_to_i32;
 use common::{NormalizedTick, Timeframe};
 use contracts_rs::{market_stream as ms, tick as pt, volume_to_sentinel};
-use contracts_rs::tick as pt;
 
 use crate::aggregator::CandleDelta;
 use crate::candle::Candle;
@@ -75,7 +74,7 @@ pub fn snapshot_to_proto(symbol: &str, tf: Timeframe, candles: &[Candle]) -> ms:
         highs.push(c.h);
         lows.push(c.l);
         closes.push(c.c);
-        volumes.push(c.v.map(|v| v as i64).unwrap_or(VOLUME_NONE));
+        volumes.push(volume_to_sentinel(c.v));
     }
 
     ms::Snapshot {
