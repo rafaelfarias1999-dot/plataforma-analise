@@ -1,7 +1,7 @@
 //! Binário orquestrador da plataforma de análise EUR/USD.
 //!
 //! Amarra a pipeline completa:
-//!   Provider → FeedHandler → Sequencer → (mpsc) → Aggregator → (broadcast) → [Hub futuro]
+//!   Provider → FeedHandler → Sequencer → (mpsc) → Aggregator → (broadcast) → [Hub]
 //!
 //! # Ordem de fiação (importante)
 //! O `status_receiver()` vem do FeedHandler, que precisa do Sequencer. Por isso:
@@ -118,12 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Shutdown gracioso ---
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Ctrl+C recebido, encerrando...");
-        }
+        _ = tokio::signal::ctrl_c() => { info!("Ctrl+C recebido, encerrando..."); }
         r = feed_task => { info!(?r, "feed_task terminou"); }
-        r = agg_task => { info!(?r, "agg_task terminou"); }
-        r = hub_task => { info!(?r, "hub_task terminou"); }
+        r = agg_task  => { info!(?r, "agg_task terminou"); }
+        r = hub_task  => { info!(?r, "hub_task terminou"); }
     }
 
     Ok(())
