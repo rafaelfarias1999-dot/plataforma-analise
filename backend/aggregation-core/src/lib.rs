@@ -4,6 +4,7 @@ pub mod tick_store;
 pub mod candle;
 pub mod candle_store;
 pub mod aggregator;
+pub mod proto;
 
 pub use ring_buffer::RingBuffer;
 pub use sequencer::{Sequencer, SequencerMetrics};
