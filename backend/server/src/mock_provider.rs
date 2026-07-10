@@ -1,65 +1,68 @@
-//! Provider de teste (replay sintético) — APENAS para smoke-test da pipeline.
-//! NÃO usar em produção. Substitua por um FeedProvider real (broker/CSV).
+//! # MockFeedProvider — Feed SINTÉTICO para DESENVOLVIMENTO
+//!
+//! ⚠️  ATENÇÃO: este provider FABRICA preços (random walk). Ele existe
+//! exclusivamente como harness de desenvolvimento/teste e é marcado como
+//! `TickSource::Test` em toda a pipeline. NUNCA deve ser usado em produção
+//! nem apresentado como feed real. Só é ativado via `USE_MOCK_FEED=1`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
 use common::error::FeedError;
 use common::types::ProviderStatus;
 use feed_handler::{FeedProvider, RawTick};
 
-pub struct MockReplayProvider {
+pub struct MockFeedProvider {
     symbol: String,
     status: ProviderStatus,
     last_mid: f64,
-    seed: u64,
+    rng: StdRng,
 }
 
-impl MockReplayProvider {
+impl MockFeedProvider {
     pub fn new(symbol: &str) -> Self {
         Self {
             symbol: symbol.to_string(),
             status: ProviderStatus::Disconnected,
             last_mid: 1.08420,
-            seed: 0x9E3779B97F4A7C15,
+            rng: StdRng::seed_from_u64(0xEA9_F00D),
         }
-    }
-
-    /// PRNG determinístico (xorshift) — passeio de preço reprodutível.
-    fn next_rand(&mut self) -> f64 {
-        self.seed ^= self.seed << 13;
-        self.seed ^= self.seed >> 7;
-        self.seed ^= self.seed << 17;
-        (self.seed as f64 / u64::MAX as f64) - 0.5 // [-0.5, 0.5)
     }
 }
 
 #[async_trait]
-impl FeedProvider for MockReplayProvider {
+impl FeedProvider for MockFeedProvider {
     async fn connect(&mut self) -> Result<(), FeedError> {
         self.status = ProviderStatus::Connected;
         Ok(())
     }
 
     async fn next_tick(&mut self) -> Result<Option<RawTick>, FeedError> {
-        // ~50 ticks/s
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        // Cadência sintética ~5ms (≈200 ticks/s).
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
-        // Passeio aleatório de ±0.2 pip sobre o último mid.
-        self.last_mid += self.next_rand() * 0.00004;
+        // Random walk em torno do último mid.
+        let step: f64 = self.rng.gen_range(-0.00005..0.00005);
+        self.last_mid += step;
 
-        let ts_ns = SystemTime::now()
+        let spread = 0.00010; // 1 pip
+        let bid = self.last_mid - spread / 2.0;
+        let ask = self.last_mid + spread / 2.0;
+
+        let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+            .map_err(|e| FeedError::ProtocolError(e.to_string()))?
+            .as_nanos() as u64;
 
-        let spread = 0.00002; // 0.2 pip
         Ok(Some(RawTick {
             symbol: self.symbol.clone(),
-            timestamp_ns: ts_ns,
-            bid: self.last_mid - spread / 2.0,
-            ask: self.last_mid + spread / 2.0,
-            volume: None, // FX real raramente fornece — NUNCA fabricamos
+            timestamp_ns,
+            bid,
+            ask,
+            volume: None, // NUNCA fabricamos volume.
         }))
     }
 
@@ -73,6 +76,6 @@ impl FeedProvider for MockReplayProvider {
     }
 
     fn provider_name(&self) -> &str {
-        "mock-replay"
+        "mock-dev-synthetic"
     }
 }
