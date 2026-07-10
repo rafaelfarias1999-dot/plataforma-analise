@@ -60,9 +60,6 @@ impl FeedHandlerService {
 
     /// Inicia o loop de ingestão.
     /// Esta função roda indefinidamente, reconectando em caso de falha.
-    ///
-    /// # Cancelamento
-    /// Use o CancellationToken do Tokio ou drop a task para parar.
     #[instrument(skip(self), name = "feed_handler")]
     pub async fn run(&mut self) -> Result<(), FeedError> {
         let mut reconnect_attempts: u32 = 0;
@@ -139,7 +136,8 @@ impl FeedHandlerService {
                 }
             };
 
-            // Enviar ao Sequencer (validação + armazenamento)
+            // Enviar ao Sequencer (validação + armazenamento).
+            // process_tick agora é async — usa .write().await internamente.
             let mut sequencer = self.sequencer.write().await;
             match sequencer.process_tick(normalized).await {
                 Ok(seq) => {
