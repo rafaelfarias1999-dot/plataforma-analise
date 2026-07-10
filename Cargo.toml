@@ -18,7 +18,6 @@ members = [
     "backend/aggregation-core",
     "backend/feed-handler",
     "backend/server",
-    "backend/broadcast-hub",
 ]
 resolver = "2"
 
@@ -41,8 +40,6 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 async-trait = "0.1"
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
 
 # =============================================================================
 # Perfil Release — Otimizado para latência mínima em produção
@@ -67,6 +64,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
 
 # =============================================================================
 # Perfil Dev — Balanceado entre velocidade de compilação e debugging
