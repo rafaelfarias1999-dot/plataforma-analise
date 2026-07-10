@@ -1,0 +1,21 @@
+app = "plataforma-analise"
+primary_region = "gru"  # São Paulo — menor latência para o Brasil
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "info"
+  # USE_MOCK_FEED = "1"  # DEV apenas — feed sintético. Remova em produção.
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Feed ao vivo não pode dormir: mantém a máquina sempre ligada.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
