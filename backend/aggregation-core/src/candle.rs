@@ -3,8 +3,8 @@ use common::NormalizedTick;
 /// Representação de uma vela (Candle) em alta performance.
 ///
 /// # Design
-/// Utiliza primitivos `i64` para preços (micropips) a fim de evitar 
-/// erros de arredondamento inerentes a ponto flutuante. Esta estrutura 
+/// Utiliza primitivos `i64` para preços (micropips) a fim de evitar
+/// erros de arredondamento inerentes a ponto flutuante. Esta estrutura
 /// é compacta e projetada para viver em ring buffers contíguos (zero-allocation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candle {
@@ -37,10 +37,6 @@ impl Default for Candle {
 
 impl Candle {
     /// Cria uma nova vela a partir de um tick inicial e do timestamp do bucket.
-    ///
-    /// # Parâmetros
-    /// * `bucket_ts_ns`: O tempo do bucket calculado (`floor(ts / interval) * interval`).
-    /// * `tick`: O primeiro tick que pertence a este bucket.
     pub fn new(bucket_ts_ns: u64, tick: &NormalizedTick) -> Self {
         Self {
             t: bucket_ts_ns,
@@ -53,7 +49,7 @@ impl Candle {
     }
 
     /// Cria uma vela "flat" a partir do fechamento de uma vela anterior.
-    /// Utilizado pelo Watchdog quando um bucket inteiro passa sem nenhum tick 
+    /// Utilizado pelo Watchdog quando um bucket inteiro passa sem nenhum tick
     /// por conta de baixa liquidez. NUNCA simula volume.
     pub fn flat_from_previous(bucket_ts_ns: u64, prev_close: i64) -> Self {
         Self {
@@ -75,20 +71,23 @@ impl Candle {
         if tick.mid < self.l {
             self.l = tick.mid;
         }
-        
+
         self.c = tick.mid; // O fechamento é sempre o mid do último tick recebido
 
-        // Acumula volume caso ambos (vela atual e tick) tenham o valor.
-        // Se um deles não tiver (provider não forneceu), lidamos como propagação de 'Some'
+        // Acumula volume apenas quando o tick fornece. Se ausente, preserva o
+        // estado atual (nunca fabrica).
         if let Some(tick_vol) = tick.volume {
             self.v = Some(self.v.unwrap_or(0) + tick_vol);
         }
     }
 
-    /// Valida se a vela foi construída de maneira lógica (Low <= Open/Close/High e High >= Open/Close/Low).
+    /// Valida a coerência OHLC: Low é o piso, High é o teto de O/C, e High >= Low.
     pub fn is_valid(&self) -> bool {
-        self.l <= self.o && self.l <= self.c && self.l <= self.h &&
-        self.h >= self.o && self.h >= self.c
+        self.h >= self.l
+            && self.l <= self.o
+            && self.l <= self.c
+            && self.h >= self.o
+            && self.h >= self.c
     }
 }
 
@@ -137,7 +136,7 @@ mod tests {
         assert_eq!(candle.h, 1084250);
         assert_eq!(candle.l, 1084150);
         assert_eq!(candle.c, 1084150);
-        assert_eq!(candle.v, Some(15)); // Volume não altera já que o provider omitiu neste tick
+        assert_eq!(candle.v, Some(15)); // Volume não altera já que o provider omitiu
 
         assert!(candle.is_valid());
     }
