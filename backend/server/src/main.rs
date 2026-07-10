@@ -1,128 +1,177 @@
-//! Binário orquestrador da plataforma de análise EUR/USD.
+//! # Server — Ponto de entrada da plataforma
 //!
-//! Amarra a pipeline completa:
-//!   Provider → FeedHandler → Sequencer → (mpsc) → Aggregator → (broadcast) → [Hub]
+//! Faz o wiring de toda a pipeline e expõe o servidor WebSocket:
 //!
-//! # Ordem de fiação (importante)
-//! O `status_receiver()` vem do FeedHandler, que precisa do Sequencer. Por isso:
-//!   canais → tick_store → Sequencer → FeedHandler → status_rx → Aggregator.
+//! ```text
+//! [FeedProvider] → FeedHandler → Sequencer → (broadcast NormalizedTick)
+//!                                                     │
+//!                                                     ▼
+//!                                       MultiTimeframeAggregator
+//!                                                     │ (broadcast CandleEvent)
+//!                                                     ▼
+//!                                         Hub (encode Protobuf) → WebSocket clients
+//! ```
+//!
+//! # Integridade
+//! Sem provider real configurado, NENHUM feed é iniciado: o sistema permanece
+//! em estado DISCONNECTED e nenhum candle é fabricado. O feed sintético só é
+//! ativado explicitamente via `USE_MOCK_FEED=1` (DEV apenas).
 
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{info, error};
-use tracing_subscriber::EnvFilter;
-
-use common::{PlatformConfig, TickSource, Timeframe};
-use aggregation_core::{
-    MultiTimeframeAggregator, Sequencer, RingBuffer, CandleEvent,
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::Response,
+    routing::get,
+    Router,
 };
-use feed_handler::FeedHandlerService;
+use tokio::sync::{broadcast, RwLock};
 
+use aggregation_core::{CandleEvent, MultiTimeframeAggregator, RingBuffer, Sequencer};
+use common::{NormalizedTick, PlatformConfig, TickSource, Timeframe};
+use feed_handler::{FeedHandlerService, FeedProvider};
+
+mod convert;
+mod hub;
 mod mock_provider;
-use mock_provider::MockReplayProvider;
 
-/// Capacidade do canal Sequencer → Aggregator. Grande o bastante pra absorver
-/// rajadas sem estourar RAM; quando cheio, o Sequencer aplica backpressure.
-const TICK_CHANNEL_CAP: usize = 65_536;
+use hub::Hub;
 
-/// Capacidade do canal broadcast Aggregator → consumidores (hub/SMC).
-const EVENT_CHANNEL_CAP: usize = 65_536;
+/// Capacidade dos canais broadcast internos (ticks e eventos de candle).
+const CHANNEL_CAPACITY: usize = 65_536;
+/// Timeframe default enviado no snapshot inicial de conexão.
+const DEFAULT_TF: Timeframe = Timeframe::M1;
+/// Quantidade de candles no snapshot inicial.
+const SNAPSHOT_COUNT: usize = 1_500;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // --- Observabilidade ---
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
-    // --- Config (usa defaults se o arquivo não existir) ---
+    // Configuração: tenta config.toml, cai para defaults sensatos.
     let config = PlatformConfig::from_file("config.toml").unwrap_or_else(|_| {
-        info!("config.toml não encontrado; usando defaults");
+        tracing::info!("config.toml não encontrado — usando defaults");
         PlatformConfig::default()
     });
-    info!(?config, "Configuração carregada");
 
-    // --- 1. Canais ---
-    // Sequencer → Aggregator: mpsc (backpressure, sem perda de ticks).
-    let (tick_tx, tick_rx) = mpsc::channel(TICK_CHANNEL_CAP);
-    // Aggregator → consumidores: broadcast (fan-out para N clientes/SMC).
-    let (event_tx, _event_rx) = broadcast::channel::<CandleEvent>(EVENT_CHANNEL_CAP);
+    let tick_capacity = config.tick_buffer.capacity;
+    let candle_capacity = config.tick_buffer.candle_capacity;
+    let dedup = config.tick_buffer.dedup_window;
+    let symbol = config.symbol.clone();
 
-    // --- 2. Tick store (ring buffer bruto, pré-alocado) ---
-    let tick_store = Arc::new(RwLock::new(
-        RingBuffer::new(config.tick_buffer.capacity),
-    ));
+    // === Canais internos ===
+    let (tick_tx, tick_rx) = broadcast::channel::<NormalizedTick>(CHANNEL_CAPACITY);
+    let (event_tx, event_rx) = broadcast::channel::<CandleEvent>(CHANNEL_CAPACITY);
 
-    // --- 3. Sequencer (envolvido em Arc<RwLock> pro FeedHandler escrever) ---
-    let sequencer = Sequencer::new(
-        Arc::clone(&tick_store),
-        tick_tx,
-        config.tick_buffer.dedup_window,
-    );
-    let sequencer = Arc::new(RwLock::new(sequencer));
+    // === Tick Store (ring buffer bruto) ===
+    let tick_store = Arc::new(RwLock::new(RingBuffer::new(tick_capacity)));
 
-    // --- 4. Provider concreto ---
-    // Troque MockReplayProvider por sua implementação real de FeedProvider.
-    let provider = Box::new(MockReplayProvider::new(&config.symbol));
+    // === Sequencer ===
+    let sequencer = Arc::new(RwLock::new(Sequencer::new(
+        tick_store.clone(),
+        tick_tx.clone(),
+        dedup,
+    )));
 
-    // --- 5. FeedHandler ---
-    let mut feed_handler = FeedHandlerService::new(
-        provider,
-        Arc::clone(&sequencer),
-        TickSource::Live,
-    );
+    // === Aggregator multi-timeframe ===
+    let tfs = Timeframe::all_candle_timeframes();
+    let (mut aggregator, stores) =
+        MultiTimeframeAggregator::new(tick_rx, event_tx.clone(), tfs, candle_capacity);
 
-    // --- 6. Pega o status_receiver ANTES de mover o handler pra task ---
-    let status_rx = feed_handler.status_receiver();
-
-    // --- 7. Aggregator, já ligado ao status ---
-    let timeframes: &[Timeframe] = Timeframe::all_candle_timeframes();
-    let (aggregator, stores) = MultiTimeframeAggregator::new(
-        tick_rx,
-        event_tx.clone(),
-        timeframes,
-        config.tick_buffer.candle_capacity,
-    );
-    let mut aggregator = aggregator.with_status_receiver(status_rx);
-
-    // --- 7b. Broadcast Hub (WebSocket) ---
-    let hub_state = std::sync::Arc::new(broadcast_hub::HubState {
-        event_tx: event_tx.clone(),
-        stores, // move o HashMap<Timeframe, CandleStore> pro hub servir snapshots
-        config: broadcast_hub::HubConfig {
-            bind_addr: config.network.ws_bind_addr.clone(),
-            port: config.network.ws_port,
-            symbol: config.symbol.clone(),
-        },
-    });
-    
-    let hub_task = tokio::spawn(async move {
-        if let Err(e) = broadcast_hub::run(hub_state).await {
-            error!(error = %e, "Broadcast Hub encerrou com erro");
-        }
-    });
-
-    // --- 8. Sobe as tasks ---
-    let feed_task = tokio::spawn(async move {
-        if let Err(e) = feed_handler.run().await {
-            error!(error = %e, "FeedHandler encerrou com erro");
-        }
-    });
-
-    let agg_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         aggregator.run().await;
     });
 
-    info!("Pipeline no ar. Ctrl+C para encerrar.");
+    // === Broadcast Hub (encode Protobuf + fan-out WebSocket) ===
+    let (frame_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(CHANNEL_CAPACITY);
+    let hub = Arc::new(Hub {
+        frame_tx,
+        stores,
+        symbol: symbol.clone(),
+        default_tf: DEFAULT_TF,
+        snapshot_count: SNAPSHOT_COUNT,
+    });
+    hub::spawn_encoder(hub.clone(), event_rx);
 
-    // --- Shutdown gracioso ---
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => { info!("Ctrl+C recebido, encerrando..."); }
-        r = feed_task => { info!(?r, "feed_task terminou"); }
-        r = agg_task  => { info!(?r, "agg_task terminou"); }
-        r = hub_task  => { info!(?r, "hub_task terminou"); }
+    // === Feed Handler ===
+    if std::env::var("USE_MOCK_FEED").is_ok() {
+        tracing::warn!(
+            "USE_MOCK_FEED ativo — feed SINTÉTICO (somente DEV). NUNCA use em produção."
+        );
+        let provider: Box<dyn FeedProvider> =
+            Box::new(mock_provider::MockFeedProvider::new(&symbol));
+        let mut feed = FeedHandlerService::new(provider, sequencer.clone(), TickSource::Test);
+        tokio::spawn(async move {
+            if let Err(e) = feed.run().await {
+                tracing::error!(error = %e, "Feed handler terminou com erro");
+            }
+        });
+    } else {
+        tracing::warn!(
+            "Nenhum provider real configurado — sistema em DISCONNECTED. \
+             Injete um FeedProvider real ou use USE_MOCK_FEED=1 para dev."
+        );
     }
 
+    // === Servidor WebSocket ===
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .route("/health", get(|| async { "ok" }))
+        .with_state(hub.clone());
+
+    let addr = format!("{}:{}", config.network.ws_bind_addr, config.network.ws_port);
+    tracing::info!(%addr, "WebSocket server ouvindo");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
     Ok(())
+}
+
+/// Handler de upgrade WebSocket.
+async fn ws_handler(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, hub))
+}
+
+/// Ciclo de vida de uma conexão WebSocket:
+/// 1. Envia o Snapshot inicial (série histórica colunar).
+/// 2. Faz stream de CandleDelta/CandleClose em tempo real.
+async fn handle_socket(mut socket: WebSocket, hub: Arc<Hub>) {
+    // 1. Snapshot inicial
+    let snapshot = hub.build_snapshot(hub.default_tf).await;
+    if socket.send(Message::Binary(snapshot)).await.is_err() {
+        return;
+    }
+
+    // 2. Stream ao vivo
+    let mut rx = hub.frame_tx.subscribe();
+    loop {
+        tokio::select! {
+            frame = rx.recv() => match frame {
+                Ok(bytes) => {
+                    if socket.send(Message::Binary(bytes.as_ref().clone())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(missed, "Cliente WS lento — frames descartados");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                // Mensagens de controle do cliente (ex: trocar timeframe) entrariam aqui.
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            }
+        }
+    }
 }
