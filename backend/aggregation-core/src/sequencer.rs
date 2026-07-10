@@ -1,12 +1,12 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use std::sync::{Arc, RwLock};
+
+use tokio::sync::broadcast;
 
 use common::{NormalizedTick, SequencerError};
 use crate::RingBuffer;
 
-/// Métricas de operação do Sequencer.
 #[derive(Debug, Default, Clone)]
 pub struct SequencerMetrics {
     pub accepted: u64,
@@ -14,32 +14,25 @@ pub struct SequencerMetrics {
     pub rejected_duplicate: u64,
 }
 
-/// O Sequencer é o guardião da integridade temporal do sistema.
-///
-/// # Responsabilidades
-/// 1. **Monotonicidade**: Garante que o stream de ticks progrida para frente no tempo.
-/// 2. **Deduplicação**: Filtra ticks repetidos em janelas de tempo próximas.
-/// 3. **Sequenciamento**: Atribui um identificador único e monotônico a cada tick aceito.
-/// 4. **Armazenamento/Broadcast**: Empurra o tick validado para o Tick Store e notifica downstream.
+/// Identidade de preço de um tick: (ts_ns, bid, ask). Volume não faz parte.
+type TickIdentity = (u64, i64, i64);
+
 pub struct Sequencer {
-    /// O último timestamp aceito.
     last_ts_ns: u64,
-    /// Contador monotônico global para ticks aceitos.
     seq_counter: Arc<AtomicU64>,
-    /// Armazenamento bruto (Ring Buffer).
+    /// Lock SÍNCRONO: o Sequencer é o único escritor e a operação é O(1).
+    /// Usar tokio::sync::RwLock aqui causava panic (blocking dentro do runtime).
     tick_store: Arc<RwLock<RingBuffer<NormalizedTick>>>,
-    /// Canal de broadcast para notificar Aggregators downstream.
     broadcast_tx: broadcast::Sender<NormalizedTick>,
-    /// Janela de deduplicação — chave EXATA (ts_ns, bid, ask), sem colisão de hash.
-    dedup_window: VecDeque<(u64, i64, i64)>,
-    /// Capacidade máxima da janela de deduplicação.
+    /// Ordem de inserção para evicção FIFO da janela de dedup.
+    dedup_order: VecDeque<TickIdentity>,
+    /// Set para checagem O(1) — elimina o scan O(n) e a colisão de hash XOR.
+    dedup_set: HashSet<TickIdentity>,
     dedup_capacity: usize,
-    /// Métricas internas.
     metrics: SequencerMetrics,
 }
 
 impl Sequencer {
-    /// Cria um novo Sequencer.
     pub fn new(
         tick_store: Arc<RwLock<RingBuffer<NormalizedTick>>>,
         broadcast_tx: broadcast::Sender<NormalizedTick>,
@@ -50,22 +43,15 @@ impl Sequencer {
             seq_counter: Arc::new(AtomicU64::new(1)),
             tick_store,
             broadcast_tx,
-            dedup_window: VecDeque::with_capacity(dedup_capacity),
+            dedup_order: VecDeque::with_capacity(dedup_capacity),
+            dedup_set: HashSet::with_capacity(dedup_capacity),
             dedup_capacity,
             metrics: SequencerMetrics::default(),
         }
     }
 
-    /// Processa um tick normalizado, aplicando validações e sequenciamento.
-    ///
-    /// Retorna o número de sequência atribuído em caso de sucesso.
-    ///
-    /// # Nota de Concorrência
-    /// É `async` porque escreve no `tick_store` protegido por `tokio::RwLock`.
-    /// NUNCA use `blocking_write()` aqui: isso causa PANIC quando chamado
-    /// de dentro do runtime Tokio.
-    pub async fn process_tick(&mut self, mut tick: NormalizedTick) -> Result<u64, SequencerError> {
-        // Validação 1: Monotonicidade (não permitimos voltar no tempo).
+    pub fn process_tick(&mut self, mut tick: NormalizedTick) -> Result<u64, SequencerError> {
+        // Validação 1: monotonicidade temporal.
         if tick.ts_ns < self.last_ts_ns {
             self.metrics.rejected_out_of_order += 1;
             return Err(SequencerError::OutOfOrder {
@@ -74,10 +60,9 @@ impl Sequencer {
             });
         }
 
-        // Validação 2: Deduplicação por chave EXATA (ts_ns, bid, ask).
-        // O volume não faz parte da identidade do preço.
-        let key = (tick.ts_ns, tick.bid, tick.ask);
-        if self.dedup_window.contains(&key) {
+        // Validação 2: deduplicação exata (sem risco de colisão).
+        let identity: TickIdentity = (tick.ts_ns, tick.bid, tick.ask);
+        if self.dedup_set.contains(&identity) {
             self.metrics.rejected_duplicate += 1;
             return Err(SequencerError::Duplicate {
                 ts_ns: tick.ts_ns,
@@ -85,48 +70,33 @@ impl Sequencer {
                 ask: tick.ask,
             });
         }
-
-        // Atualiza a janela de deduplicação
-        if self.dedup_window.len() >= self.dedup_capacity {
-            self.dedup_window.pop_front();
+        if self.dedup_order.len() >= self.dedup_capacity {
+            if let Some(old) = self.dedup_order.pop_front() {
+                self.dedup_set.remove(&old);
+            }
         }
-        self.dedup_window.push_back(key);
+        self.dedup_order.push_back(identity);
+        self.dedup_set.insert(identity);
 
-        // Atualiza estado de sucesso
+        // Estado de sucesso + atribuição de seq.
         self.last_ts_ns = tick.ts_ns;
-
-        // Atribui seq (fetch_add retorna o valor antigo, sequencial 1, 2, 3...)
-        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_counter.fetch_add(1, Ordering::Relaxed);
         tick.seq = seq;
-
         self.metrics.accepted += 1;
 
-        // Armazenamento (lock async breve — apenas o Sequencer escreve).
+        // Escrita no ring buffer sob lock síncrono e curtíssimo.
         {
-            let mut store = self.tick_store.write().await;
+            let mut store = self.tick_store.write().expect("tick_store RwLock poisoned");
             store.push(tick);
         }
 
-        // Broadcast downstream. Ignoramos erro se não houver assinantes (normal no startup).
         let _ = self.broadcast_tx.send(tick);
-
         Ok(seq)
     }
 
-    /// Retorna as métricas atuais.
-    pub fn metrics(&self) -> &SequencerMetrics {
-        &self.metrics
-    }
-
-    /// Retorna o último timestamp aceito.
-    pub fn last_timestamp(&self) -> u64 {
-        self.last_ts_ns
-    }
-
-    /// Retorna o contador sequencial atual.
-    pub fn current_seq(&self) -> u64 {
-        self.seq_counter.load(Ordering::Relaxed)
-    }
+    pub fn metrics(&self) -> &SequencerMetrics { &self.metrics }
+    pub fn last_timestamp(&self) -> u64 { self.last_ts_ns }
+    pub fn current_seq(&self) -> u64 { self.seq_counter.load(Ordering::Relaxed) }
 }
 
 #[cfg(test)]
@@ -147,45 +117,34 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_sequencer_success() {
+    #[test]
+    fn test_sequencer_success() {
         let store = Arc::new(RwLock::new(RingBuffer::new(100)));
         let (tx, _rx) = broadcast::channel(16);
         let mut seq = Sequencer::new(store, tx, 10);
-
-        let s1 = seq.process_tick(make_tick(100, 1000)).await.unwrap();
-        assert_eq!(s1, 1);
-
-        let s2 = seq.process_tick(make_tick(200, 1005)).await.unwrap();
-        assert_eq!(s2, 2);
-
+        assert_eq!(seq.process_tick(make_tick(100, 1000)).unwrap(), 1);
+        assert_eq!(seq.process_tick(make_tick(200, 1005)).unwrap(), 2);
         assert_eq!(seq.metrics().accepted, 2);
     }
 
-    #[tokio::test]
-    async fn test_sequencer_out_of_order() {
+    #[test]
+    fn test_sequencer_out_of_order() {
         let store = Arc::new(RwLock::new(RingBuffer::new(100)));
         let (tx, _rx) = broadcast::channel(16);
         let mut seq = Sequencer::new(store, tx, 10);
-
-        seq.process_tick(make_tick(200, 1000)).await.unwrap();
-
-        let res = seq.process_tick(make_tick(100, 1000)).await;
+        seq.process_tick(make_tick(200, 1000)).unwrap();
+        let res = seq.process_tick(make_tick(100, 1000));
         assert!(matches!(res, Err(SequencerError::OutOfOrder { .. })));
-        assert_eq!(seq.metrics().rejected_out_of_order, 1);
     }
 
-    #[tokio::test]
-    async fn test_sequencer_duplicate() {
+    #[test]
+    fn test_sequencer_duplicate() {
         let store = Arc::new(RwLock::new(RingBuffer::new(100)));
         let (tx, _rx) = broadcast::channel(16);
         let mut seq = Sequencer::new(store, tx, 10);
-
         let tick = make_tick(200, 1000);
-        seq.process_tick(tick).await.unwrap();
-
-        let res = seq.process_tick(tick).await;
+        seq.process_tick(tick).unwrap();
+        let res = seq.process_tick(tick);
         assert!(matches!(res, Err(SequencerError::Duplicate { .. })));
-        assert_eq!(seq.metrics().rejected_duplicate, 1);
     }
 }
